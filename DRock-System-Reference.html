@@ -1,0 +1,481 @@
+<!doctype html><html><head><meta charset="utf-8"><title>DRock System Reference</title><style>
+:root{--ink:#1d2329;--dim:#5b6670;--rule:#d5dbe1;--accent:#2f5d8a;--box:#eef3f8}
+@page{size:Letter;margin:16mm 15mm 16mm 15mm}
+body{font-family:Georgia,"Times New Roman",serif;color:var(--ink);font-size:10.5pt;line-height:1.45;margin:0}
+h1{font-size:30pt;margin:0 0 8pt;color:var(--accent);font-weight:normal}
+h2{font-family:"Segoe UI",Arial,sans-serif;font-size:15pt;color:var(--accent);border-bottom:1.5px solid var(--accent);padding-bottom:3pt;margin:22pt 0 8pt;break-after:avoid}
+h3{font-family:"Segoe UI",Arial,sans-serif;font-size:11.5pt;margin:12pt 0 4pt;break-after:avoid}
+p,li{orphans:3;widows:3}
+code{font-family:Consolas,monospace;font-size:9pt;background:#f2f4f6;padding:0 2px;border-radius:2px}
+table{border-collapse:collapse;width:100%;margin:6pt 0 10pt;font-size:9.5pt;break-inside:auto}
+tr{break-inside:avoid}
+th,td{border:1px solid var(--rule);padding:4pt 6pt;text-align:left;vertical-align:top}
+th{background:var(--box);font-family:"Segoe UI",Arial,sans-serif;font-size:9pt}
+table.small{font-size:8.6pt}
+td.num{text-align:right;white-space:nowrap}
+.mods td:first-child{white-space:nowrap}
+.dim{color:var(--dim);font-size:8pt}
+.box{background:var(--box);border-left:4px solid var(--accent);padding:7pt 10pt;margin:8pt 0}
+.diagram pre,pre.cmd{font-family:Consolas,monospace;font-size:8.3pt;line-height:1.3;background:#f6f8fa;border:1px solid var(--rule);padding:8pt;white-space:pre;break-inside:avoid}
+.cover{min-height:230mm;display:flex;flex-direction:column;justify-content:center;break-after:page}
+.kicker{font-family:"Segoe UI",Arial,sans-serif;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);font-size:9pt;margin-bottom:10pt}
+.lede{font-size:13pt;color:#34404a;max-width:150mm}
+.facts{margin-top:18pt}.facts th{width:24mm}
+.note{color:var(--dim);font-size:9pt}
+.toc{break-after:page}.toc ol{columns:2;font-size:11pt;line-height:1.7}
+</style></head><body><section class="cover">
+  <div class="kicker">System reference · 20 November 2026</div>
+  <h1>DRock, from the ground up</h1>
+  <p class="lede">A small local model paired with a deterministic executor. The model proposes, the executor decides,
+  the operating system executes, and verification establishes what actually happened.</p>
+  <table class="facts">
+    <tr><th>Source</th><td><code>%USERPROFILE%\Desktop\drock</code>, git, branch <code>speed-reread</code>, 149 commits, last 0ca3041 (2026-11-07) plus uncommitted work</td></tr>
+    <tr><th>Size</th><td>102 top-level modules, 74,587 lines; 311 test files, about 4,800 test methods</td></tr>
+    <tr><th>Actions</th><td>114 in the protocol: 65 LOW, 33 MEDIUM, 16 HIGH</td></tr>
+    <tr><th>Models</th><td>qwen3:0.6b (reflex), qwen3:4b-instruct-2507 Q4_K_M (mid and coder), gemma3:4b (vision), all local in Ollama</td></tr>
+    <tr><th>Machine</th><td>Windows 11 Home 25H2, Intel i5-8400, 32 GB RAM, Intel Arc A380 (6 GB), C: on a hard disk</td></tr>
+    <tr><th>Language</th><td>Python 3.10+, standard library only (the optional native engine adds numpy and regex)</td></tr>
+  </table>
+  <p class="note">Every number in this document was read from the tree or its logs on 2026-11-20. Three or more sessions edit
+  DRock at once, so counts move; <code>wc -l</code> and <code>python -m unittest discover -s drock/tests -t .</code> are the authority.</p>
+</section>
+
+<nav class="toc">
+<h2>Contents</h2>
+<ol>
+<li>What DRock is and the bet it makes</li>
+<li>The machine it runs on</li>
+<li>The architecture in one page</li>
+<li>The life of one request</li>
+<li>The agent loop</li>
+<li>The action protocol</li>
+<li>The executor</li>
+<li>The completion gate</li>
+<li>Policy, guard and the other safety layers</li>
+<li>Fast paths: answers with no model call</li>
+<li>The conversation layer</li>
+<li>Models, servers and the GPU</li>
+<li>Memory, knowledge and learned material</li>
+<li>Perception and effect: what DRock can touch</li>
+<li>Remote AIs and the planner (opt-in only)</li>
+<li>State, storage and logs</li>
+<li>Measuring DRock</li>
+<li>The development tooling around DRock</li>
+<li>Design rules</li>
+<li>What the bugs taught</li>
+<li>Command reference</li>
+<li>Open work</li>
+<li>Appendix: every module</li>
+</ol>
+</nav>
+
+<h2 id="s1">1. What DRock is and the bet it makes</h2>
+<p>DRock is a computer-use agent for one Windows PC. You type a request in plain English ("create notes.txt on the desktop with milk and bread",
+"why is billing.py returning 2", "what's using my disk"), and DRock does it with tools on the real machine, or answers it, or asks what you meant.</p>
+<p>Most agents chase reliability with a bigger model. DRock makes the opposite bet. Its models are 0.6B to 4B parameters, they run on a
+6 GB card, and nothing they say is treated as fact. A small model is fairly good at picking which operation to do next. It is bad at
+knowing whether that operation worked, and it will announce success after doing nothing. That one failure, <b>false success</b>, is what
+the whole system is built to make impossible.</p>
+<p>Three rules follow, and almost every module exists to serve one of them:</p>
+<ol>
+<li><b>The model emits exactly one structured action per turn.</b> One JSON object, decoded under a grammar, so a malformed action cannot even be produced.</li>
+<li><b>The model never verifies itself.</b> The executor runs the action, re-reads the world, and hands the model the real result word for word.</li>
+<li><b>The model does not decide when the task is done.</b> A deterministic gate (<code>expect.py</code>) reads what the request demands from its text,
+checks the verified trace, and refuses <code>COMPLETE</code> until the evidence exists.</li>
+</ol>
+<div class="box"><b>The invariant.</b> The completion gate may only ever grow stricter. A change that lets a previously failing trace pass is a regression.
+A labelled corpus (<code>tests/test_gate_corpus.py</code>) and a replay of every real task (<code>drock audit</code>) make that measurable.</div>
+<p>Two more commitments shape the design. DRock is <b>offline</b>: no model call leaves the machine, and there is no bigger cloud model to escalate to.
+The only network traffic is a read the user asked for (a web search, a page fetch). And DRock <b>reports what happened</b>, including
+"I did X but could not verify it", which it never counts as done.</p>
+
+<h2 id="s2">2. The machine it runs on</h2>
+<table>
+<tr><th>Part</th><th>What it is</th><th>Why it matters to DRock</th></tr>
+<tr><td>CPU</td><td>Intel i5-8400, 6 cores</td><td>Runs the executor, the tests, and the native engine when used</td></tr>
+<tr><td>GPU</td><td>Intel Arc A380, 6 GB, Vulkan</td><td>Runs the models through a Vulkan build of Ollama on port 11435; prompt processing there is about 14 times faster than the CUDA/CPU build on 11434</td></tr>
+<tr><td>RAM</td><td>32 GB</td><td>Holds a spilled model and the prompt cache; an orphaned runner once took 11.4 GB of it</td></tr>
+<tr><td>Disk</td><td>C: is a hard disk</td><td>Model loads use <code>use_mmap=false</code> (170 s became 5 s); the full test suite takes 10+ minutes</td></tr>
+<tr><td>OS</td><td>Windows 11 Home 25H2 (build 26200)</td><td>Smart App Control blocks the unsigned <code>llama-server.exe</code>, so DRock serves its models through Ollama</td></tr>
+</table>
+<p>Runtime facts that shaped the code: the Arc can enter a degraded state after a Vulkan "device lost" and then runs about 30 times slower until a
+driver restart (Win+Ctrl+Shift+B). A <code>llama-server.exe</code> runner can outlive its Ollama and keep its VRAM while <code>/api/ps</code> says
+nothing is loaded; killing one took gemma3:4b from 4.0 to 20.8 tokens/s. Both are detected and reported rather than guessed at.</p>
+
+<h2 id="s3">3. The architecture in one page</h2>
+<div class="diagram">
+<pre>
+ you ──► front door (REPL / drock &lt;goal&gt; / drockclaude console / drock --console)
+          │
+          ▼
+   chat.py  classify each line: CHAT or TASK  (rules first, a 2-way model vote last)
+          │                                   │
+     CHAT │                                   │ TASK
+          ▼                                   ▼
+   grounded answer, primers,         FAST PATHS, no model call
+   depth.py budget, features         memory answer · macros.py · offline books
+   (selfinfo, "what's new")          calc · QUERY_TABLE · repo setup · reference
+                                              │ no rule matched every clause
+                                              ▼
+                     ┌──────────────── agent.py loop ────────────────┐
+                     │ OBSERVE  observe.py snapshot + memory recall   │
+                     │ PLAN     model emits ONE JSON action (grammar) │
+                     │ ACT      guard ► policy ► executor (actions.py)│
+                     │ VERIFY   executor re-reads the world           │
+                     │ GATE     expect.missing(goal, trace)           │
+                     └───┬──────────────┬─────────────────┬──────────┘
+                         │ unmet        │ nothing unmet   │ stuck
+                         ▼              ▼                 ▼
+                 "Still missing: …"  COMPLETE allowed,  clean-context
+                  back to the model  answer checked by   restart (max 2)
+                                     expect.unfaithful()
+                                              │
+                                              ▼
+                   trace.py row ─► traces.jsonl ─► audit / stats / trust / exemplars
+</pre>
+</div>
+<p>The pieces fall into five layers. <b>Front doors</b> take the line in (cli.py, chat.py, ui.py, console.py). <b>Deciders</b> work out what the line
+needs without a model where they can (macros.py, expect.py, depth.py, need.py, spell.py, verbs.py). <b>The loop</b> drives the model one action
+at a time (agent.py, model.py, schema.py, thought.py, lookahead.py). <b>The boundary</b> decides what may run and runs it (guard.py, policy.py,
+actions.py, integrity.py, snapshot.py, redact.py, untrusted.py). <b>Records</b> keep what happened and turn it into measurement (trace.py,
+events.py, latency.py, audit.py, stats.py, trust.py, corpus.py).</p>
+
+<h2 id="s4">4. The life of one request</h2>
+<p>Take "please search the online news for trending topics", typed in the REPL.</p>
+<ol>
+<li><b>Read the line.</b> <code>ui.py</code> owns the terminal. <code>spell.py</code> corrects a misspelt word only toward something DRock can check
+(a verb the gate knows, an installed program, a file in the folder). <code>verbs.py</code> holds the one table of surface verbs both the gate and the macros read.</li>
+<li><b>Chat or task.</b> <code>chat.Session.classify()</code> runs a cascade of deterministic rules: follow-up questions ("why?", "show evidence"),
+questions about DRock, opinion and discussion questions, explicit commands. Only when nothing matches does it ask the model a two-way question
+under a binary grammar. This line is a task.</li>
+<li><b>Fast paths.</b> Before any model call: is it answerable from verified memory? Does every clause match a macro rule? Is it a first-aid,
+mechanical or survival question, a calculation, a table query? Here an explicit web lookup compiles straight to <code>SEARCH_WEB</code>.</li>
+<li><b>Loop, if needed.</b> Otherwise <code>agent.Agent.run()</code> routes to a tier (reflex for short open/close commands, coder for code words,
+mid for the rest), builds the prompt, and runs the loop in section 5.</li>
+<li><b>Every action</b> passes <code>guard.check</code> (no provable no-ops), then <code>policy.decide</code> (risk tier, mode, protected paths), then the
+executor handler, which verifies its own effect.</li>
+<li><b>Stop.</b> The task ends when <code>expect.missing()</code> is empty and the final answer survives <code>expect.unfaithful()</code>, or on a hard stop,
+which is reported as a failure in DRock's own words built from the gate's unmet list.</li>
+<li><b>Record.</b> <code>trace.py</code> appends the goal, every action, every verified result, what the gate still wanted, and any action the
+user declined. <code>activity.py</code> prints the Inspected / Found / Changed / Validation report. <code>latency.py</code> logs where the seconds went.</li>
+</ol>
+
+<h2 id="s5">5. The agent loop (<code>agent.py</code>)</h2>
+<p>The conversation the model sees is always the same shape: the system prompt (protocol and rules), then the system state, the facts DRock knows and
+the task, then alternating turns of its own action and a <code>RESULT: {...}</code> message carrying the executor's real output. It never sees
+its own summary of anything.</p>
+<h3>One step</h3>
+<table>
+<tr><th>Phase</th><th>Code</th><th>What happens</th></tr>
+<tr><td>Observe</td><td><code>observe.snapshot()</code>, <code>memory.recall()</code></td><td>Machine state and the few verified facts relevant to this goal</td></tr>
+<tr><td>Think</td><td><code>thought.py</code></td><td>Three sentences written before the model is called: what the request still needs, what the last step actually did, what follows. Built only from the gate's unmet list and the last step's verified flag, never from file contents</td></tr>
+<tr><td>Plan</td><td><code>model.py</code>, <code>schema.py</code></td><td>The model emits one action under a JSON-schema grammar; <code>reason</code> is the first property, so it states intent before it commits to an action name</td></tr>
+<tr><td>Act</td><td><code>guard.py</code>, <code>policy.py</code>, <code>actions.py</code></td><td>Refuse no-ops, check permission, run, verify</td></tr>
+<tr><td>Gate</td><td><code>expect.missing()</code></td><td>What the goal demands that the trace does not yet prove</td></tr>
+</table>
+<h3>Recovery, not escalation</h3>
+<p>There is no bigger model to hand off to. After three invalid outputs, three repeats of the same action, or three failures in a row, the loop
+restarts the conversation from a clean context (at most twice per task). The new context carries one sentence on what went wrong, the steps
+already verified, the actions that already failed with their errors, and what the gate still wants. A small model wedged in a bad frame often
+solves the same task cleanly on a second pass stripped of the confusion. This is the highest-leverage mechanism in the loop.</p>
+<h3>Loop guards</h3>
+<table>
+<tr><th>Situation</th><th>Response</th></tr>
+<tr><td>A failed action proposed again unchanged</td><td>Resampled once, warmer, with the error in view; if identical again it is not run and the model is told why</td></tr>
+<tr><td>Same action repeated, already succeeded</td><td>Not re-run; the model is nudged to the next step</td></tr>
+<tr><td>Repeats three times, goal already satisfied</td><td>Finishes successfully: the model just failed to say COMPLETE</td></tr>
+<tr><td>One action class fails twice with varied arguments</td><td>That class is withheld from the grammar for one turn (thrash guard)</td></tr>
+<tr><td>A package manager says a name does not exist</td><td>That name is dead for that manager for the rest of the task</td></tr>
+<tr><td>Three read-only steps repeating earlier calls with the same results</td><td>STALLED: the task stops and says so</td></tr>
+<tr><td>Context filling up</td><td><code>_fit()</code> keeps the system prompt and task, drops the oldest exchanges, and notes what is already verified</td></tr>
+</table>
+<h3>Steering and refusing</h3>
+<p>The gate's unmet list is appended as <code>Still missing: …</code> after every turn, at the tail, where it cannot be trimmed and does not disturb the
+cache-stable prompt prefix. Before the first model call, <code>expect.impossible()</code> refuses a task the current mode cannot do at all (a write
+in readonly mode), in 0.00 s with nothing run. Grammar exclusions remove whole action families a goal has no business using: a read-only goal
+is offered nothing above LOW, an offline goal never sees the web actions, settings, Android and office actions appear only when the goal names them.</p>
+
+<h2 id="s6">6. The action protocol (<code>schema.py</code>)</h2>
+<p>114 actions, each with a strict parameter schema, a risk tier and a one-line description. <code>json_schema()</code> compiles them into a
+<code>oneOf</code> with required parameters mandatory, so <code>OPEN_URL</code> without a <code>url</code> is ungrammatical, not merely rejected.
+Arguments are typed where that has no side effect (a font size of 6 to 72, a non-empty <code>old_string</code>); an enum over installed program
+names was tried and made things worse, and JSON <code>pattern</code> is refused because Ollama silently drops the whole grammar when it sees one.</p>
+<table class="small">
+<tr><th>Tier</th><th>Count</th><th>Actions</th></tr>
+<tr><td>LOW<br><span class="dim">observe; auto in every mode</span></td><td>65</td><td>ANALYZE_FILE ANDROID_APPS ANDROID_DEVICES ANDROID_INFO ANDROID_LOGCAT ANDROID_SCREENSHOT ASK_USER CALCULATE CHECK_CPU CHECK_DISK CHECK_HARDWARE CHECK_MEMORY CHECK_NETWORK CHECK_OS CHECK_PACKAGE COMPLETE DETECT_PROJECT DIAGNOSE_ERROR DNS_LOOKUP DROCK_INFO FETCH_URL FILE_INFO FIND_TOOL FIREWALL_STATUS GET_SETTING GET_SYSTEM_INFO GIT_STATE INSPECT_DOCUMENT INSPECT_WINDOW LARGEST_FILES LIST_APPLICATIONS LIST_DIRECTORY LIST_PORTS LIST_PROCESSES LIST_WINDOWS LOCATE_ON_SCREEN MODEL_DEVICE NET_CONFIG NET_DIAGNOSE OPEN_APPLICATION OPEN_URL PING_HOST PROBE_URL QUERY_TABLE QUICK_REFERENCE READ_FILE READ_SCREEN_TEXT SCAN_THREATS SCREENSHOT SEARCH_FILES SEARCH_IMAGES SEARCH_KNOWLEDGE SEARCH_PAPERS SEARCH_REPOS SEARCH_SOCIAL SEARCH_WEB SEARCH_WIKI STOP_SERVICE SUBNET_CALC TEST_PORT TRACE_ROUTE USE_SKILL WAIT_UNTIL WIFI_PROBE WIFI_STATUS</td></tr>
+<tr><td>MEDIUM<br><span class="dim">change things</span></td><td>33</td><td>ANDROID_CONNECT ANDROID_PULL ANDROID_PUSH APPEND_FILE APPLY_PATCH CLOSE_APPLICATION COPY_FILE CREATE_DIRECTORY CREATE_DOCUMENT CREATE_FILE CREATE_PRESENTATION CREATE_SPREADSHEET DELETE_LINES DOWNLOAD_FILE EDIT_DOCUMENT EDIT_FILE EXPORT_PDF FIND_USERNAME FOCUS_WINDOW INSERT_LINES INSTALL_PACKAGE MOVE_FILE ORGANIZE_FOLDER REPLACE_LINE REVERT_FILE RUN_COMMAND RUN_TESTS SET_MODEL_DEVICE SET_SETTING START_SERVICE WIFI_FIX WRITE_FILE WRITE_PROGRAM</td></tr>
+<tr><td>HIGH<br><span class="dim">destructive, admin, desktop input</span></td><td>16</td><td>ADMIN_COMMAND ANDROID_INSTALL_APP ANDROID_SHELL ANDROID_UNINSTALL_APP CLEAR_DIRECTORY CLICK_AT CLICK_ELEMENT DELETE_FILE INSTALL_FROM_FILE INSTALL_FROM_WEB PRESS_KEYS REACH RUN_MAINTENANCE STOP_THREAT TYPE_TEXT UNINSTALL_PACKAGE</td></tr>
+</table>
+<p><b>Dangerous-command escalation.</b> <code>RUN_COMMAND</code> is the escape hatch, so it is re-graded HIGH when its text matches about 40 compiled
+patterns covering POSIX (<code>rm -rf</code>, <code>mkfs</code>, <code>dd if=</code>, <code>git push --force</code>) and Windows (<code>rmdir /s</code>,
+<code>format X:</code>, <code>Remove-Item -Recurse</code>, <code>diskpart</code>, <code>reg delete</code>, <code>vssadmin delete</code>). Regexes, because the
+old substring list missed <code>rm -fr /</code> and every Windows form. A command that names DRock's own data folder is HIGH too.</p>
+
+<h2 id="s7">7. The executor (<code>actions.py</code>, 7,061 lines)</h2>
+<p>The executor is the only component that touches the machine and the only one allowed to say what happened. Every handler returns a <code>Result</code>:</p>
+<table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><code>ok</code></td><td>Did it succeed</td></tr>
+<tr><td><code>verified</code></td><td>Was the effect checked against the world afterwards; set only by an independent check, never because a command exited 0</td></tr>
+<tr><td><code>verification</code></td><td>The human-readable proof: "file exists, 3 lines, sha256 ab12…"</td></tr>
+<tr><td><code>output</code> / <code>error</code></td><td>Real output and the real error, cut down to the useful line</td></tr>
+<tr><td><code>changed</code></td><td>Workspace files a command actually changed (a stat diff of the tree before and after)</td></tr>
+<tr><td><code>tests_ran</code></td><td>How many tests a runner reported running; "the tests passed" with zero tests run is not evidence</td></tr>
+</table>
+<p><b>Verification is per action.</b> A created file is re-opened and hashed; a move checks the source is gone and the destination exists; a Windows setting
+counts as changed only when Windows reads back the asked value; an installed program counts when Windows lists it; a GUI click is checked by re-reading
+the accessibility tree. <code>journal.py</code> adds the NTFS change journal as a second, kernel-side receipt for commands. <code>snapshot.py</code> copies
+what a MEDIUM or HIGH action is about to touch, so a change can be diffed and rolled back. <code>integrity.py</code> refuses a green test run that did not
+execute the program the task named (a stub, a copy, a shell builtin cannot stand in for it).</p>
+<p><b>Forgiveness for form, never for substance.</b> <code>patching.py</code> keeps a file's line endings, final newline and encoding on every edit and writes
+atomically. A near-miss edit can be repaired, and the trace says <code>[MODEL ERROR repaired: …]</code>; an unverified action is never made to look verified.</p>
+<p><b>Foreign text is data.</b> <code>untrusted.py</code> marks everything an action reads (a page, a file, a window's text) as content from outside the
+conversation, after a page that said "Ignore all previous instructions" was read by gemma3:4b as an order. <code>redact.py</code> replaces secret values
+before any tool output reaches the model, the screen or the trace.</p>
+<p><b>Reading anything.</b> <code>formats.py</code> extracts text from PDF, Word, Excel, PowerPoint, OpenDocument, EPUB, RTF, archives and SQLite with the
+standard library; <code>fileinfo.py</code> names a file's real type from its magic bytes; <code>codeinfo.py</code> gives a 4B model an outline with line ranges
+instead of 2,000 raw lines; <code>tabular.py</code> loads a table into in-memory SQLite so a sum or a maximum is computed, never guessed.</p>
+
+<h2 id="s8">8. The completion gate (<code>expect.py</code>, 4,645 lines)</h2>
+<p><code>missing(goal, trace)</code> is the stop decision. It reads the goal text and the verified trace, never the model's words, and returns the
+requirements still unproven. Each one is a sentence that goes straight back to the model, so the rule that blocks a false COMPLETE is also the
+rule that says what to do next.</p>
+<table>
+<tr><th>Requirement</th><th>Read from the goal</th><th>Satisfied by</th></tr>
+<tr><td><code>verb:&lt;class&gt;</code></td><td>An imperative verb at a clause boundary</td><td>A verified action of that class (a command counts for a write only if <code>changed</code> is non-empty)</td></tr>
+<tr><td><code>path</code></td><td>A path, or "called X", "named X and Y"</td><td>A verified action naming it</td></tr>
+<tr><td><code>under</code></td><td>"subfolders inside it called A and B"</td><td>Actions naming parent/child</td></tr>
+<tr><td><code>plural</code></td><td>"all the images", "every .jpg"</td><td>As many verified moves as a verified listing showed</td></tr>
+<tr><td><code>literal</code></td><td>'quoted text', "containing: X", named columns</td><td>That text in a verified action's parameters, still true at the end (freshness)</td></tr>
+<tr><td><code>prints</code></td><td>"prints X"</td><td>A successful command whose output contains X</td></tr>
+<tr><td><code>tests</code></td><td>"run the tests", "make them pass"</td><td>A runner reporting tests ran, green after the last edit</td></tr>
+<tr><td><code>count</code></td><td>"number of lines in X"</td><td>A printed number matching a read of X</td></tr>
+<tr><td><code>office</code>, <code>sorted</code>, <code>saved</code>…</td><td>Document, ordering and download words</td><td>The document's real structure, the rows' order, the file's bytes</td></tr>
+<tr><td><code>question</code></td><td>A trailing ? with no action verb</td><td>At least one verified observation</td></tr>
+</table>
+<p>Rules learned the hard way: a verb counts only at a clause boundary (", then run" once lost the <code>run</code> requirement and let a failing test run
+complete a task); evidence must be <b>fresh</b> (content written and then overwritten no longer counts); a <b>proxy</b> verification that reads the same
+whether or not the goal was reached is not evidence (OPEN_URL used to verify by "a browser process is running"); rhetoric ("make sure", "let me know")
+is stripped. Unknown is an outcome: when the action ran but its effect could not be confirmed, <code>expect.unverified()</code> names it and DRock says
+"did X but could not verify the outcome, so not claiming it".</p>
+<p>The answer is checked too. <code>expect.unfaithful()</code> runs on every successful exit: a read-and-tell answer must occur in what was read, a list of
+<code>.md</code> files may name only <code>.md</code> files a listing showed. <code>grounding.py</code> applies the same idea to chat answers built from primers.</p>
+
+<h2 id="s9">9. Policy, guard and the other safety layers</h2>
+<table>
+<tr><th>Mode</th><th>LOW</th><th>MEDIUM</th><th>HIGH</th></tr>
+<tr><td><code>ask</code> (default)</td><td>auto</td><td>ask once per action type per session</td><td>ask every time</td></tr>
+<tr><td><code>auto</code></td><td>auto</td><td>auto</td><td>ask</td></tr>
+<tr><td><code>yolo</code></td><td>auto</td><td>auto</td><td>auto (sandbox and benchmarks only)</td></tr>
+<tr><td><code>readonly</code></td><td>auto</td><td>denied</td><td>denied</td></tr>
+</table>
+<ul>
+<li><b>Protected paths</b> refuse writes before any prompt: <code>~/.ssh</code> and <code>~/.gnupg</code> (reads too), system folders, Program Files, and
+DRock's own <code>data/</code>. A model that talks the user into "yes" still cannot write its own permission file, its trace log (the audit's proof) or its memory.</li>
+<li><b>Shell commands</b> are resolved word by word against the working directory, because three rounds of testing found three ways past a string match
+(<code>echo &gt; data/policy.json</code>, a relative Windows path, a path inside a quoted Python one-liner). The stated limit: a path assembled at run time
+defeats any text inspection, and a test pins that as a known boundary.</li>
+<li><b>Desktop input</b> (click, type, keys) is HIGH and off unless <code>"gui": true</code> is set, because a click names no path and so escapes every path check.</li>
+<li><b>guard.py</b> refuses actions that are well-formed and allowed but provably useless: an edit whose old text equals its new text, a directory named like a
+file, a package name a manager already said it does not have, an absolute path the user never wrote (path fidelity).</li>
+<li><b>Self-edits</b> to DRock's own code always ask, in every mode. <code>webinstall.py</code> runs only signed installers and asks twice; <code>portable.py</code>
+extracts archives and never runs them.</li>
+</ul>
+
+<h2 id="s10">10. Fast paths: answers with no model call</h2>
+<p>A small model spends two to four generations on "create a directory called notes", and each is a chance to go wrong. Rigid shapes compile instead.
+The executor still runs and verifies every compiled action under the same policy, and the task still cannot finish until the gate is satisfied, so a
+shortcut can never claim what the slow path could not.</p>
+<table>
+<tr><th>Path</th><th>Module</th><th>Covers</th></tr>
+<tr><td>Macros</td><td><code>macros.py</code> (4,164 lines)</td><td>File, folder, move, copy, delete, organise, open, close, install, uninstall, git, ping, DNS, ports, subnet, settings, maintenance, hardware, explicit web lookups, fact questions. A goal compiles only if every clause matches a rule</td></tr>
+<tr><td>Offline books</td><td><code>firstaid.py</code>, <code>mechanic.py</code>, <code>survival.py</code>, <code>refbook.py</code></td><td>38 first-aid protocols, 32 mechanical procedures, 35 survival plans, as data in the package; the answer is a dictionary lookup</td></tr>
+<tr><td>Arithmetic</td><td><code>calc.py</code></td><td>An AST walker over numbers and operators; "17 * 23" is computed, not searched</td></tr>
+<tr><td>Memory answers</td><td><code>memory.py</code></td><td>A fact question about a stored, verified fact</td></tr>
+<tr><td>About DRock</td><td><code>features.py</code>, <code>selfinfo.py</code></td><td>"What's new" (39 features in <code>features.jsonl</code>), DRock's own paths and state</td></tr>
+<tr><td>Repo setup</td><td><code>repo_setup.py</code></td><td>"clone URL into DIR, install it, run X"</td></tr>
+<tr><td>Navigation</td><td><code>navigate.py</code></td><td><code>REACH("Settings &gt; System &gt; Display")</code> as one verified walk instead of three model turns</td></tr>
+</table>
+<p>Which shapes earned a rule was decided by the log: 623 of 3,561 recorded tasks were model-driven runs that used one kind of action.
+"Organize downloads folder" took 541 s and moved nothing through the model, and 1.3 s with every file sorted through the rule. The honest
+figure for the rulebook is the held-out one: it covers 12 of the 15 default benchmark goals but only 11 of 30 rewordings of them. So a rule is
+added for a shape, never for one sentence.</p>
+
+<h2 id="s11">11. The conversation layer</h2>
+<p><code>chat.py</code> (2,380 lines) is the front door for talk. Chat is answered free-form and streamed; tasks go to the agent; task results fold back into
+the conversation so "what did you just do?" works.</p>
+<ul>
+<li><code>depth.py</code> picks one of seven intents (DIRECT, EXPLAIN, DEEP_DIVE, LEARN, CREATE, EXECUTE, RESEARCH) and a budget rung from 80 to 900+
+tokens in 0.7 ms, plus a one-line blueprint appended to the user message (never the system prompt, which would evict the prefix cache).</li>
+<li><code>grounding.py</code> turns retrieved primers into numbered facts; the model must answer from them and an invented claim is withdrawn. 98
+offline primers cover big questions (philosophy, computing, science).</li>
+<li><code>need.py</code> reads what finished looks like when the words state a symptom ("billing.py returns 2, it should return 5").
+<code>english.py</code> restates a multi-clause request as numbered clauses for the model only.</li>
+<li>Clarifying questions: a request that names nothing ("whats new") is asked about: "Do you mean what's new in DRock, or today's news?"</li>
+<li><code>prompt_budget.py</code> holds ceilings for the prompts that decide the wait; the short chat prompt is about 174 units.</li>
+</ul>
+
+<h2 id="s12">12. Models, servers and the GPU</h2>
+<table>
+<tr><th>Tier</th><th>Model (data/models.json, 2026-11-20)</th><th>Used for</th></tr>
+<tr><td>reflex</td><td>qwen3:0.6b</td><td>Short single-verb commands, routing</td></tr>
+<tr><td>mid</td><td>qwen3:4b-instruct-2507 Q4_K_M</td><td>The default planner</td></tr>
+<tr><td>coder</td><td>qwen3:4b-instruct-2507 Q4_K_M</td><td>Code words or a code-file extension</td></tr>
+<tr><td>vision</td><td>gemma3:4b</td><td>Screenshot fallback; proposes coordinates, never establishes them</td></tr>
+<tr><td>cand_*</td><td>gemma3:4b, phi4-mini, ministral-3:3b, MiniCPM5 1B/2B, native and BitNet variants</td><td>Candidates for benchmark bake-offs</td></tr>
+</table>
+<p><b>Backends.</b> Ollama is the live backend (llama-server is blocked by Smart App Control). A Vulkan build serves the Arc on 127.0.0.1:11435 and the installer
+build on 11434 is the fallback. <code>server.autostart()</code> starts the Vulkan server when it is down; every fallback is printed and logged so a CPU run
+is never reported as a GPU run. <code>native.py</code> is DRock's own engine: a numpy transformer (GQA, RoPE, SwiGLU, fp16 KV cache, prefix reuse), a
+byte-level BPE tokenizer read from the GGUF (<code>bpe.py</code>) and constrained decoding by scaffolding (<code>scaffold.py</code>), checked token for token
+against Ollama. It also runs BitNet b1.58 through a numba int8 kernel at 6.9 tokens/s. It is a portability proof, not the default.</p>
+<p><b>Determinism recipe.</b> Every request carries <code>seed: 0</code>; servers DRock starts pin one slot, flash attention off and an f16 KV cache;
+the tier's context size never changes between calls. <code>drock selftest --determinism</code> sends three prompts twice and compares bytes.
+<b>keep_alive</b> is per caller: the agent holds a model for 30 minutes, probes and benchmarks run with <code>DROCK_KEEP_ALIVE=0</code>.</p>
+
+<h2 id="s13">13. Memory, knowledge and learned material</h2>
+<table>
+<tr><th>Store</th><th>Module</th><th>Holds</th><th>Rule</th></tr>
+<tr><td><code>data/memory.db</code></td><td><code>memory.py</code></td><td>Verified machine facts, app aliases, project facts; SQLite + FTS5</td><td>Only writes carrying the verifying action and its Result; recall is context, never evidence</td></tr>
+<tr><td>Knowledge cards</td><td><code>knowledge.py</code>, <code>learn.py</code></td><td>Procedural lesson cards in 20 topics (python, c, cpp, java, rust, asm, shell, cli, web, office, debug, net, safety, writing, primers and more), injected one per matching goal</td><td><code>/learn</code> keeps a card only if a held-out set measurably improves</td></tr>
+<tr><td><code>data/exemplars.db</code></td><td><code>exemplars.py</code></td><td>Past tasks that passed: goal and verified action sequence</td><td>Advice the model may ignore; same-task leakage excluded</td></tr>
+<tr><td>Offline Wikipedia</td><td><code>wiki.py</code></td><td>12 Kiwix ZIM archives (Wikipedia starter, Appropedia, Arch wiki, Python/Bash/SQLite docs, Energypedia and others)</td><td>Standard-library ZIM reader and FTS5 index; a fact question is answered from disk before the web</td></tr>
+<tr><td>Trust</td><td><code>trust.py</code></td><td>Per task class: supervised, probation, independent</td><td>Recomputed from the trace log every time, so it cannot drift</td></tr>
+<tr><td>False-success corpus</td><td><code>corpus.py</code></td><td>Every claim the independent checker refuted</td><td>Append-only and hash-chained</td></tr>
+</table>
+
+<h2 id="s14">14. Perception and effect: what DRock can touch</h2>
+<table class="small">
+<tr><th>Area</th><th>Modules</th><th>What it does</th></tr>
+<tr><td>The machine</td><td>observe, hardware, machine, gpulink</td><td>CPU, RAM, disks, GPUs, SMART wear, which machine this copy is on, where the model runs</td></tr>
+<tr><td>Files and code</td><td>actions, patching, fileinfo, formats, codeinfo, diagnose, project, gitstate, tabular</td><td>Read, write, edit by line or patch, diagnose compiler and test output, detect a project's build and test commands</td></tr>
+<tr><td>Office</td><td>office (+ tools/office/.venv)</td><td>Real .docx, .xlsx, .pptx and PDF export through python-docx/openpyxl out of process, and DRock's own reader to verify them</td></tr>
+<tr><td>Desktop</td><td>gui, navigate, vision, settings</td><td>Windows, accessibility trees, screenshots, grounded clicks and typing, Windows settings written and read back</td></tr>
+<tr><td>Software</td><td>software, uninstall, webinstall, portable, toolmatrix</td><td>One idea of "a program" across winget, the registry, Store apps; signed web installers; what installed tools can do a job</td></tr>
+<tr><td>Network</td><td>nettools, services</td><td>ipconfig/ping/tracert/DNS/ports/Wi-Fi parsed into facts; background services started only when the OS proves them alive</td></tr>
+<tr><td>Web</td><td>web, web_extract, web_sources, reach</td><td>DuckDuckGo search, page text, papers, GitHub repos, discussions, images; per-platform routers for a URL</td></tr>
+<tr><td>Security and upkeep</td><td>threats, vulnscan, maintenance, redact</td><td>Programs running from drop folders, weak settings, the Windows maintenance sweep verified task by task</td></tr>
+<tr><td>Phones</td><td>android</td><td>The adb protocol spoken directly (adb.exe only starts the server); 11 ANDROID_* actions</td></tr>
+</table>
+
+<h2 id="s15">15. Remote AIs and the planner (opt-in only)</h2>
+<p>DRock's own tiers never leave the machine. One door was opened on 2026-10-07: a line that starts with <code>/claude</code>, <code>/chatgpt</code>, <code>/gemini</code>,
+<code>/deepseek</code>, <code>/meta</code>, <code>/venice</code>, <code>/muse</code> or <code>/aimode</code> goes to that service, and nothing else does.
+<code>planner.py</code> lets that remote model plan in DRock's action protocol while DRock validates, shows, asks, runs and verifies every step; HIGH actions are
+always asked. <code>remote_web.py</code> drives the chat sites over the Chrome DevTools Protocol in a visible browser; <code>tribunal.py</code> puts every relay in
+one conversation chaired by Claude; <code>claudeskills.py</code> lets those planners read Claude Code's installed skills.</p>
+
+<h2 id="s16">16. State, storage and logs</h2>
+<p><code>paths.py</code> declares every location DRock reads or writes. Three kinds:</p>
+<table>
+<tr><th>Kind</th><th>Where</th><th>What</th></tr>
+<tr><td>Source</td><td><code>Desktop\drock\</code></td><td>Code; never written at run time</td></tr>
+<tr><td>Data</td><td><code>drock\data\</code> or <code>$DROCK_DATA</code></td><td>Everything this copy accumulates; gitignored, protected from the model</td></tr>
+<tr><td>Machine</td><td><code>~\.local\state\drock</code> or <code>$DROCK_RUNTIME</code></td><td>Locks, pid files, server logs: they belong to the computer, not to a copy</td></tr>
+</table>
+<p>What <code>data\</code> holds today: <code>traces.jsonl</code> (469 rows, plus 4,375 in the rotated <code>.1</code>), <code>latency.jsonl</code> (7,578 turns),
+<code>events.jsonl</code> (every event with a sequence number taken at the source), <code>memory.db</code>, <code>exemplars.db</code>, <code>false_success.jsonl</code>,
+the knowledge library, wiki archives, benchmark rows, <code>models.json</code>, <code>policy.json</code>, <code>gpu.json</code>, <code>machine.json</code>, screenshots,
+snapshots, and the state of the dev tools (testwatch, drockclaude, nightshift). <code>bundle.py</code> copies the whole install to a drive and proves on the
+other side what arrived and what had to be retired.</p>
+
+<h2 id="s17">17. Measuring DRock</h2>
+<table>
+<tr><th>Instrument</th><th>What it measures</th></tr>
+<tr><td><code>benchmark/</code> (run.py, check.py, contracts)</td><td>60 real requests across Word, Excel, PowerPoint, files, web, PDF, code and chains. A stdlib checker in its own process, which never imports DRock, inspects the machine afterwards and writes a receipt per requirement. DRock's claim is recorded beside the verdict and never used for it. 227 runs on disk</td></tr>
+<tr><td><code>drock audit</code></td><td>Replays every logged task through today's gate; exits non-zero if the gate accepts anything it once rejected</td></tr>
+<tr><td><code>drock selftest</code></td><td>About 30 executor checks with no model, in a temp folder</td></tr>
+<tr><td><code>drock bench</code></td><td>15 default tasks plus opt-in categories, including 30 held-out rewordings that reuse the originals' checkers</td></tr>
+<tr><td><code>drock stats</code></td><td>Share of tasks with zero model calls, recurring failure signatures, goal shapes worth compiling</td></tr>
+<tr><td><code>benchmark/understand.py</code></td><td>A model-free ruler over 77 typed lines: route, kinds, macro, typo, understood</td></tr>
+<tr><td><code>tools/nightshift/understand.py</code></td><td>Eight requests run through the real model, three repeats each, checking the first step and query (added 2026-11-20)</td></tr>
+<tr><td>Test suite</td><td>311 files, about 4,800 test methods; the load-bearing ones are the gate corpus, no-blind-retry, Windows path containment, exit-0-proves-nothing and byte-level write checks</td></tr>
+</table>
+<p>Recorded benchmark history: the first gemma3:4b baseline scored 17 of 60 with 22 false successes. The clean-ruler-1 run of 2026-11-02 scored 32 of 60
+with 11 false. Run-to-run noise on the same build is about 13 of 60, which is why the adoption rule refuses any change smaller than the measured noise.</p>
+
+<h2 id="s18">18. The development tooling around DRock</h2>
+<p>These are tools for building DRock, not part of its runtime.</p>
+<table>
+<tr><th>Tool</th><th>Where</th><th>Role</th></tr>
+<tr><td>testwatch</td><td><code>tools/testwatch</code></td><td>Runs the suite after every code change and every 4 hours, plus a known-answer patrol; tracks flaky tests</td></tr>
+<tr><td>drockclaude</td><td><code>tools/drockclaude</code></td><td>A visible console where Claude drives DRock through real tasks and keeps a scorecard; <code>@claude</code> and <code>@grok</code> lines talk to them; <code>smoke.py</code> runs fixed tasks scored from disk</td></tr>
+<tr><td>DRock-Evolve</td><td><code>evolve/</code></td><td>Searches over marked EVOLVE-BLOCKs (prompt, gate tables, macro rules) in git worktrees through a cascade: admissible, suite, gate corpus, bench</td></tr>
+<tr><td>NightShift</td><td><code>tools/nightshift</code></td><td>Overnight: scouts papers and repos, hunts problems (failing tests, false-success classes, slow routes, misread requests), and runs Claude, Grok and OpenCode as competing arms in temp worktrees judged by tests and probes. Nothing is applied without a person running <code>nightshift apply</code></td></tr>
+<tr><td>Office worker</td><td><code>tools/office</code></td><td>The out-of-process python-docx/openpyxl venv</td></tr>
+<tr><td>Others</td><td><code>tools/llama</code>, <code>tools/lmgrep</code>, <code>tools/train</code></td><td>llama.cpp binaries, a local grep helper, training scripts</td></tr>
+</table>
+<p>The research folder (<code>research/</code>, 26 studies) holds the audits behind these decisions: capbench, the gate mutation study, the prompt-cache probe,
+the flow-stability study, the tribunal audit and others. Each audit names what was adopted, what was rejected and why.</p>
+
+<h2 id="s19">19. Design rules</h2>
+<ol>
+<li>The model never verifies itself. Ground truth is the executor re-reading the world.</li>
+<li>No escalation. Getting unstuck is a clean-context restart, not a bigger model.</li>
+<li>Fully offline. The one exception is a network read a task explicitly asks for; offline Wikipedia answers fact questions first.</li>
+<li>The completion gate may only grow stricter.</li>
+<li>Forgiveness for form, never for substance.</li>
+<li>A shortcut may not claim what the slow path could not.</li>
+<li>Report what happened. Nothing fakes success, DRock included.</li>
+<li>When unsure whether the user asked for something or about it, answer or ask; never act. A repeated request costs a turn; an unwanted action cannot be undone.</li>
+<li>A change somewhere is not a change here: verification checks the thing that should have changed.</li>
+<li>The answer is checked, not just the looking.</li>
+</ol>
+
+<h2 id="s20">20. What the bugs taught</h2>
+<p>Each of these was found in DRock, most by running something rather than reading it. They share a shape: the code looks right, behaves the same every time,
+and destroys something.</p>
+<ul>
+<li>A <code>set</code> of candidate paths let "rename old.txt to new.txt" swap source and destination.</li>
+<li><code>p.startswith(base + "/")</code> never matched a Windows path: every write in the workspace was refused and <code>~/.ssh</code> was never protected.</li>
+<li>A text-mode append rewrote every line ending in a file, and verification (which normalised CRLF) still said it was correct.</li>
+<li>A same-size edit in the same second left <code>__pycache__</code> valid, so the tests re-ran the bug that had just been fixed.</li>
+<li>"bread. Then delete it." parsed <code>Then</code> as the verb, and a task completed having deleted nothing.</li>
+<li><code>python calc.py</code> exits 0 and changes nothing; a run "fixed" a bug that way. Hence <code>changed</code>.</li>
+<li>"Find all .md files" ended, on a 0.6B model, with a WRITE_FILE over a real <code>docs.md</code>. Read-only goals now get nothing above LOW.</li>
+</ul>
+<p>Safety properties decay the same way. The cloud-model guard was case-sensitive; the policy file's protection pointed at a folder the file had moved out of;
+the shell check assumed absolute paths, then assumed a path is its own word. Every one was found by executing the check. A guarantee nobody has run is
+not a guarantee.</p>
+
+<h2 id="s21">21. Command reference</h2>
+<pre class="cmd">
+drock                                  interactive REPL
+drock &lt;goal&gt;                           one task   (-t tier, -m ask|auto|yolo|readonly, --max-steps N,
+                                       --json, --no-fast-path, --terse, --console, --no-activity)
+drock code [check CMD | REQUEST]       coding session on this project
+drock act '{"action":"CHECK_MEMORY"}'  one action, no model
+drock observe | actions | memory       the snapshot, the protocol, machine memory
+drock selftest [--model|--determinism] deterministic tools still work
+drock bench [-t tier] [-c category]    the trace-scored suite
+python -m benchmark.run                the execution benchmark (60 contracts)
+drock audit | stats | trust            replay the gate, mine the log, per-class trust
+drock server status|start|stop|residency
+drock setup                            runtime and model files present?
+drock knowledge | learn | unlearn      lesson cards
+drock exemplars | wiki | navigate      stores and the navigation forest
+drock first-aid | fix | survive TEXT   the offline books
+drock evolve db|blocks|propose|sandbox|step
+drock bundle                           copy to a drive, check arrival, adopt here
+drock report                           activity report of the last task(s)
+REPL: /do /chat /reset /help /depth /collapse /expand /code /approval
+      /claude /chatgpt /gemini /deepseek /meta /venice /muse /aimode /tribunal /relay
+</pre>
+
+<h2 id="s22">22. Open work</h2>
+<ul>
+<li>Rollback instead of restart on recovery: <code>snapshot.py</code> has the mechanism; the call site in <code>agent.py</code> is not wired.</li>
+<li>Deterministic search on low-margin turns (<code>research/search.py</code>) is designed and not wired; <code>DROCK_SEARCH=1</code> changes nothing today.</li>
+<li>Training on the trajectory log: the executor labels its own data, so rejection-sampling fine-tuning fits, but it is blocked on data volume.</li>
+<li>Batched read-only observations (several CHECK_* in one turn).</li>
+<li>OS control families F1 to F9 beyond settings (OS-CONTROL-PLAN.md).</li>
+<li>Multi-bug debugging within the step budget; GPU stability on the A380 needs a driver newer than April 2023.</li>
+<li>A known misreading as of today: "search github for trending python projects" picks SEARCH_IMAGES in 2 of 3 runs. NightShift takes it up tonight.</li>
+</ul>
+<p>Design documents in the tree for each area: BUILD-PLAN.md, VERIFICATION-AUDIT.md, CAPABILITY-MATRIX.md, CAPABILITY-STACK.md, EVOLVE-DESIGN.md,
+LEARN-DESIGN.md, MEMORY-DESIGN.md, KNOWLEDGE.md, OS-CONTROL-PLAN.md, PORTABILITY-PLAN.md, ADAPTERS.md, GROWTH-PLAN.md, LEDGER.md and README.md (2,002 lines).</p>
+
+<h2 id="s23">23. Appendix: every module</h2>
+<p>Each top-level module with its line count and the first sentence of its own docstring.</p>
+<table class="small mods"><tr><th>Module</th><th>Lines</th><th>What it is</th></tr><tr><td><code>__init__.py</code></td><td class="num">7</td><td>DRock: a small local model paired with a deterministic executor.</td></tr><tr><td><code>__main__.py</code></td><td class="num">5</td><td>(no docstring)</td></tr><tr><td><code>actions.py</code></td><td class="num">7,061</td><td>Deterministic executor: runs a validated action and verifies the result.</td></tr><tr><td><code>activity.py</code></td><td class="num">615</td><td>Activity report: what one finished task inspected, found, changed and validated, read from its record.</td></tr><tr><td><code>agent.py</code></td><td class="num">2,675</td><td>The agent loop: OBSERVE -&gt; PLAN -&gt; ACT -&gt; VERIFY -&gt; (RECOVER | COMPLETE).</td></tr><tr><td><code>android.py</code></td><td class="num">578</td><td>Android devices, over the adb protocol DRock speaks itself.</td></tr><tr><td><code>audit.py</code></td><td class="num">127</td><td>Re-judge every finished task in the trajectory log with today&#x27;s completion gate.</td></tr><tr><td><code>bench.py</code></td><td class="num">587</td><td>Benchmark suite: tasks per tier, scored by executor verification not by model self-report.</td></tr><tr><td><code>bpe.py</code></td><td class="num">114</td><td>Byte-level BPE tokenizer read straight from a GGUF file (GPT-2 style, as used by Qwen2/Qwen3).</td></tr><tr><td><code>bundle.py</code></td><td class="num">1,038</td><td>DRock on a drive: what travels, what gets retired, and what is proven to have arrived.</td></tr><tr><td><code>calc.py</code></td><td class="num">577</td><td>Exact arithmetic for CALCULATE, and the fast path&#x27;s reading of a plain math question.</td></tr><tr><td><code>chat.py</code></td><td class="num">2,380</td><td>Conversation front door: talk to DRock like a normal chat model.</td></tr><tr><td><code>claudeskills.py</code></td><td class="num">343</td><td>Claude Code&#x27;s skills and tool repos, for the remote AIs that plan for DRock (the owner 2026-10-11: &quot;import all Claude codes skills and repos into drock, and give all relays the power to use them&quot;).</td></tr><tr><td><code>cli.py</code></td><td class="num">1,177</td><td>drock command line.</td></tr><tr><td><code>codeinfo.py</code></td><td class="num">2,642</td><td>Deterministic structural view of any source or text file, for a small offline model.</td></tr><tr><td><code>coder.py</code></td><td class="num">418</td><td>A coding session: one project, the files this process has touched, and one check command.</td></tr><tr><td><code>composer.py</code></td><td class="num">897</td><td>The pinned type box (the owner, 2026-10-23: a static type space, like Claude Code, that feels alive).</td></tr><tr><td><code>console.py</code></td><td class="num">422</td><td>`drock --console`: the full-screen session console (the owner&#x27;s B9 mockup, 2026-11-04).</td></tr><tr><td><code>corpus.py</code></td><td class="num">450</td><td>False-success corpus: every claim the independent checker refuted, kept forever.</td></tr><tr><td><code>depth.py</code></td><td class="num">302</td><td>Adaptive response depth: what KIND of answer a line needs, and how much room to give it.</td></tr><tr><td><code>determinism.py</code></td><td class="num">78</td><td>Does the same prompt come back byte-identical twice?</td></tr><tr><td><code>diagnose.py</code></td><td class="num">2,516</td><td>Turn compiler, interpreter, test-runner and runtime error output into structured diagnoses.</td></tr><tr><td><code>english.py</code></td><td class="num">174</td><td>A numbered reading of a task, for the model only.</td></tr><tr><td><code>events.py</code></td><td class="num">116</td><td>Ordered event stream: every event DRock emits gets its sequence number at the source.</td></tr><tr><td><code>exemplars.py</code></td><td class="num">653</td><td>Verified-trace exemplars (BUILD-PLAN Phase 3): DRock&#x27;s own past successes, shown to the model.</td></tr><tr><td><code>expect.py</code></td><td class="num">4,645</td><td>Deterministic completion evidence, extracted from the goal text with no model.</td></tr><tr><td><code>features.py</code></td><td class="num">111</td><td>What is new in DRock, as DRock itself can say it (drockclaude, 2026-09-23).</td></tr><tr><td><code>fileinfo.py</code></td><td class="num">698</td><td>FILE_INFO: what a file is, without running or converting it.</td></tr><tr><td><code>firstaid.py</code></td><td class="num">707</td><td>Offline first-aid protocols: the one lookup DRock must answer in milliseconds, with no model.</td></tr><tr><td><code>formats.py</code></td><td class="num">1,442</td><td>Reading files that are not plain text, with nothing but the standard library (DRock is offline and installs nothing): PDF, Word / Excel / PowerPoint, OpenDocument, EPUB, RTF, zip / tar / gz archives, SQLite databases, im</td></tr><tr><td><code>gbnf.py</code></td><td class="num">180</td><td>Raw GBNF for the action grammar (BUILD-PLAN 7.3): the same one-action-per-turn protocol that `schema.json_schema()` describes, written as a llama.cpp grammar and sent to llama-server as the request&#x27;s `grammar` field.</td></tr><tr><td><code>gguf.py</code></td><td class="num">304</td><td>GGUF v3 binary-format reader (read-only, lazy, clean-room).</td></tr><tr><td><code>gitstate.py</code></td><td class="num">299</td><td>GIT_STATE: what the repository looks like right now, from the git CLI, as data.</td></tr><tr><td><code>gpulink.py</code></td><td class="num">210</td><td>Where this install&#x27;s model runs: the CPU, or one GPU llama.cpp can see.</td></tr><tr><td><code>grounding.py</code></td><td class="num">722</td><td>Grounded answers for conversation: the notes are the authority, the model is the writer.</td></tr><tr><td><code>guard.py</code></td><td class="num">1,118</td><td>Tool guard: refuse an action that is well-formed, permitted, and a genuine no-op.</td></tr><tr><td><code>gui.py</code></td><td class="num">1,184</td><td>GUI perception: what is on the desktop, read deterministically and without a model.</td></tr><tr><td><code>hardware.py</code></td><td class="num">512</td><td>Deep hardware inventory: the facts observe.py does not carry, on Windows, macOS and Linux.</td></tr><tr><td><code>imageinfo.py</code></td><td class="num">264</td><td>Pure-stdlib image inspection — give Vosne real (if shallow) sight.</td></tr><tr><td><code>indicators.py</code></td><td class="num">184</td><td>Typed grey paragraphs shown above the spinner while a task step waits (display only).</td></tr><tr><td><code>integrity.py</code></td><td class="num">527</td><td>Verification integrity: a green run counts only when it ran the program the task designated.</td></tr><tr><td><code>journal.py</code></td><td class="num">363</td><td>What the file system says changed while a command ran: the effect receipt for RUN_COMMAND.</td></tr><tr><td><code>knowledge.py</code></td><td class="num">682</td><td>The knowledge library: coding lessons the model pulls from instead of memorising (KNOWLEDGE.md).</td></tr><tr><td><code>latency.py</code></td><td class="num">153</td><td>Where a REPL turn&#x27;s time went: its route and every model call it made, one JSON line per turn.</td></tr><tr><td><code>learn.py</code></td><td class="num">488</td><td>/learn: practise a topic, keep only the lesson cards that measurably help (LEARN-DESIGN.md).</td></tr><tr><td><code>lookahead.py</code></td><td class="num">179</td><td>Candidate actions proposed by the executor, ranked by the evidence they would produce.</td></tr><tr><td><code>machine.py</code></td><td class="num">223</td><td>Which computer this install believes it is running on, and whether that changed since last start.</td></tr><tr><td><code>macros.py</code></td><td class="num">4,164</td><td>Macro fast path: common goal shapes compiled straight to actions, with no model call.</td></tr><tr><td><code>maintenance.py</code></td><td class="num">831</td><td>Windows maintenance: the sweep, with every task verified against what actually changed.</td></tr><tr><td><code>mechanic.py</code></td><td class="num">576</td><td>Offline mechanical procedures: vehicle breakdowns, shop work and the house&#x27;s hard parts.</td></tr><tr><td><code>memory.py</code></td><td class="num">553</td><td>Persistent machine memory: what DRock has learned about this computer.</td></tr><tr><td><code>model.py</code></td><td class="num">872</td><td>Model client.</td></tr><tr><td><code>native.py</code></td><td class="num">769</td><td>drock&#x27;s own inference engine: a GGUF model file in, text out.</td></tr><tr><td><code>navigate.py</code></td><td class="num">456</td><td>Deterministic navigation by label path (BUILD-PLAN 6.5): REACH(&quot;Settings &gt; System &gt; Display&quot;).</td></tr><tr><td><code>need.py</code></td><td class="num">329</td><td>What finished looks like, when that is not what the words literally ask.</td></tr><tr><td><code>nettools.py</code></td><td class="num">2,871</td><td>Networking tools a small model can call.</td></tr><tr><td><code>observe.py</code></td><td class="num">780</td><td>System awareness: deterministic snapshots of machine state.</td></tr><tr><td><code>office.py</code></td><td class="num">1,261</td><td>Office documents (.docx, .xlsx): the adapter to python-docx and openpyxl, and DRock&#x27;s own reader.</td></tr><tr><td><code>patching.py</code></td><td class="num">528</td><td>Line edits and unified diffs that keep the file&#x27;s form.</td></tr><tr><td><code>paths.py</code></td><td class="num">141</td><td>Every location DRock reads or writes, in one place.</td></tr><tr><td><code>planner.py</code></td><td class="num">708</td><td>An LLM plans, DRock executes (the owner, 2026-10-07; research/planner/DESIGN.md).</td></tr><tr><td><code>policy.py</code></td><td class="num">625</td><td>Permission / policy layer.</td></tr><tr><td><code>portable.py</code></td><td class="num">244</td><td>Programs that are not installed: the ones published as a zip you unpack and run in place.</td></tr><tr><td><code>project.py</code></td><td class="num">764</td><td>DETECT_PROJECT: what kind of project is this folder, and how does it build, test and want to be treated?</td></tr><tr><td><code>prompt_budget.py</code></td><td class="num">138</td><td>Ceilings for the prompts that decide how long a reply waits.</td></tr><tr><td><code>reach.py</code></td><td class="num">757</td><td>One router for a URL: the backend that fits its platform, tried in a fixed order, the generic page read as the last resort, and a result that always says which channel and backend produced it.</td></tr><tr><td><code>redact.py</code></td><td class="num">409</td><td>Secret values are replaced before any tool output reaches the model or the screen.</td></tr><tr><td><code>refbook.py</code></td><td class="num">55</td><td>The shared engine behind DRock&#x27;s offline reference books (firstaid.py, mechanic.py).</td></tr><tr><td><code>remedy.py</code></td><td class="num">92</td><td>The command that would produce the evidence a goal still lacks.</td></tr><tr><td><code>remote.py</code></td><td class="num">153</td><td>Opt-in remote AIs at the REPL: /claude, /chatgpt, /deepseek, /gemini (/google), /meta, /venice, /muse, /aimode.</td></tr><tr><td><code>remote_web.py</code></td><td class="num">983</td><td>Chat websites for DRock&#x27;s opt-in remote commands (/chatgpt, /deepseek, /gemini, /meta, /venice, /muse, /aimode), driven over the Chrome DevTools Protocol in a visible browser window.</td></tr><tr><td><code>repo_setup.py</code></td><td class="num">184</td><td>Repo setup fast path: &quot;clone URL into DIR, install it from its README, run X&quot;, compiled, no model call.</td></tr><tr><td><code>scaffold.py</code></td><td class="num">220</td><td>Schema-constrained decoding by scaffolding: drock writes the JSON, the model fills the blanks.</td></tr><tr><td><code>schema.py</code></td><td class="num">630</td><td>Structured action protocol: the only thing the model is allowed to emit.</td></tr><tr><td><code>selfinfo.py</code></td><td class="num">140</td><td>DROCK_INFO: DRock&#x27;s own system, for DRock and for the remote AIs that plan for it (the owner 2026-10-10: &quot;the ability to see and query any information of drock&#x27;s full system if prompted&quot;).</td></tr><tr><td><code>selftest.py</code></td><td class="num">168</td><td>Self-test: do the deterministic tools still work on this machine?</td></tr><tr><td><code>server.py</code></td><td class="num">1,148</td><td>Local inference lifecycle: llama-server per model tier, started on demand.</td></tr><tr><td><code>services.py</code></td><td class="num">684</td><td>Background jobs and local services: start, watch, probe, list ports, stop, clean up.</td></tr><tr><td><code>settings.py</code></td><td class="num">409</td><td>SET_SETTING / GET_SETTING: Windows settings changed and read back through the API Windows itself uses.</td></tr><tr><td><code>snapshot.py</code></td><td class="num">372</td><td>Copy-on-write snapshots of what a file action is about to touch (BUILD-PLAN Phase 4.3).</td></tr><tr><td><code>software.py</code></td><td class="num">697</td><td>One idea of &quot;a piece of software&quot;, shared by everything that installs, removes or checks one.</td></tr><tr><td><code>spell.py</code></td><td class="num">289</td><td>Decode misspelt words in a request, against vocabularies DRock can actually check.</td></tr><tr><td><code>stats.py</code></td><td class="num">165</td><td>What the trajectory log says about where DRock spends its steps and loses its tasks: `drock stats`.</td></tr><tr><td><code>survival.py</code></td><td class="num">625</td><td>Offline survival procedures: lost, exposed, cut off, or riding out a disaster.</td></tr><tr><td><code>tabular.py</code></td><td class="num">344</td><td>QUERY_TABLE: a number read out of a table is computed by sqlite, never by the model.</td></tr><tr><td><code>thought.py</code></td><td class="num">102</td><td>The chain of thought for one step, written before the model is called.</td></tr><tr><td><code>threats.py</code></td><td class="num">927</td><td>Threats and vulnerabilities on this computer.</td></tr><tr><td><code>toolmatrix.py</code></td><td class="num">422</td><td>Capability to provider matrix: what on THIS machine can do a kind of job, and the command for it.</td></tr><tr><td><code>trace.py</code></td><td class="num">123</td><td>Trajectory log: every finished task, as the executor saw it, appended to a local JSONL file.</td></tr><tr><td><code>tribunal.py</code></td><td class="num">278</td><td>/tribunal: Claude chairs every relay in one conversation about how DRock could be better.</td></tr><tr><td><code>trust.py</code></td><td class="num">93</td><td>Per-class trust, replayed from the trajectory log: supervised -&gt; probation -&gt; independent.</td></tr><tr><td><code>ui.py</code></td><td class="num">1,934</td><td>Terminal presentation for the interactive front end.</td></tr><tr><td><code>uninstall.py</code></td><td class="num">680</td><td>Uninstalling a program that is actually on this machine — not only one a package manager knows.</td></tr><tr><td><code>untrusted.py</code></td><td class="num">170</td><td>Text that came from outside this conversation, handed to the model as data.</td></tr><tr><td><code>verbs.py</code></td><td class="num">75</td><td>One table of surface verbs.</td></tr><tr><td><code>vision.py</code></td><td class="num">141</td><td>The vision fallback: a local multimodal model looks at a screenshot and *proposes* where something is.</td></tr><tr><td><code>vulnscan.py</code></td><td class="num">298</td><td>Weak settings on this computer, for SCAN_THREATS.</td></tr><tr><td><code>web.py</code></td><td class="num">975</td><td>Web search and page fetch, standard library only, used only when a task asks for the web.</td></tr><tr><td><code>web_extract.py</code></td><td class="num">172</td><td>Readability-style main-content extraction — the takeable idea from Scrapling.</td></tr><tr><td><code>web_sources.py</code></td><td class="num">316</td><td>Three named corners of the web — papers, code repositories, developer discussion — standard library only, on top of web._get.</td></tr><tr><td><code>webinstall.py</code></td><td class="num">391</td><td>Install a Windows program that no package manager carries: find its official installer, download it, check its signature, run it, and confirm Windows now lists it as installed.</td></tr><tr><td><code>wiki.py</code></td><td class="num">1,209</td><td>Offline Wikipedia: a ZIM reader and a full-text index, standard library only.</td></tr></table>
+</body></html>
